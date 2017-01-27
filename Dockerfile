@@ -6,7 +6,7 @@ COPY css /app/css
 COPY js /app/js
 COPY libs /app/libs
 COPY index.html /app/index.html
-COPY zd.gexf /app/zd.gexf
+COPY graph.gexf /app/graph.gexf
 
 EXPOSE 8000
 
