@@ -1,0 +1,35 @@
+#container {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  position: absolute;
+  background: #000;
+}
+
+#control-pane {
+  top: 10px;
+  right: 10px;
+  position: absolute;
+  width: 500px;
+  background-color: rgb(249, 247, 237);
+  box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+}
+
+#control-pane > div {
+  margin: 10px;
+  overflow-x: auto;
+}
+
+h2, h3, h4 {
+  padding: 0;
+}
+
+h2.underline {
+  color: #437356;
+  background: #f4f0e4;
+  margin: 0;
+  border-radius: 2px;
+  padding: 8px 12px;
+  font-weight: 700;
+}
