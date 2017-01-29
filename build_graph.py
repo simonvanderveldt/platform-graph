@@ -1,12 +1,19 @@
 #!/usr/bin/env python
+# Outputs gexf file to show:
+# - Which origin sends request to which backends
+# - The total amount of requests received per backend
+# - The amount of requests going from origin to target
+# - The endpoints/paths used and the amount of requests they received
+
 
 import sys
 import logging
 import re
-from elasticsearch import Elasticsearch
+from elasticsearch import Elasticsearch, RequestsHttpConnection
 from networkx import nx
 from difflib import SequenceMatcher
-from collections import defaultdict
+from collections import defaultdict, Counter
+import json
 
 # Setup logging
 logger = logging.getLogger('graph-builder')
@@ -17,18 +24,980 @@ logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
 # Connect to Elasticsearch
-client = Elasticsearch(hosts=[""])
+client = Elasticsearch(hosts=["https://kibana.prd.tnt-digital.com/"],
+    connection_class=RequestsHttpConnection,
+    http_auth=('tnt', 'demo_or_die'),
+    use_ssl=True
+)
 
 # Use static list of components for now. Would be nicer to just build the
 # graph nodes dynamically from the logs.
-components = []
+components = ['bat-track-service', 'draft-service', 'timezone-service', 'identity-service', 'special-services-service', 'address-search-v2', 'shipment-history', 'country-profile-service', 'customs-rules-service', 'bob-service', 'bat-ship-service', 'label-service']
+
+request_logs = [
+    {'origin': 'timezone-service', 'path': '/service/bat-track-service/v1/track'},
+    {'origin': 'timezone-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=NW1+1AA,London&country=GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/843bc51a-3c43-4622-90e3-2a0011dfc842?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'timezone-service', 'path': '/service/special-services-service/v1/companies/843bc51a-3c43-4622-90e3-2a0011dfc842?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/843bc51a-3c43-4622-90e3-2a0011dfc842?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/843bc51a-3c43-4622-90e3-2a0011dfc842?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/special-services-service/v1/companies/843bc51a-3c43-4622-90e3-2a0011dfc842?channel=myTNT&locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/843bc51a-3c43-4622-90e3-2a0011dfc842?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/draft-service/v1/templates/cbfaf96c-bd4c-43c2-82d0-1bacefcac9b5?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/draft-service/v1/templates/1a2208a0-02cb-4e42-8f66-2f4cb3d29ab5?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/draft-service/v1/templates'},
+    {'origin': 'bat-track-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'timezone-service', 'path': '/service/special-services-service/v1/companies/843bc51a-3c43-4622-90e3-2a0011dfc842?channel=myTNT&locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/67c02e8a-327a-4051-bb73-3c51b5ed6fc0/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/news-and-events/web-seminars/deep-dive-oracle-mysql-cloud-service/'},
+    {'origin': 'label-service', 'path': '/news/en_US/2010/11/25/0003/international-congress-of-voluntary-service-1-5-december-barcelona'},
+    {'origin': 'bat-track-service', 'path': '/service/address-search-v2/postcode-search?countryCode=GB&limit=200&locale=en_GB&postcode=AA1+1AA'},
+    {'origin': 'bat-ship-service', 'path': '/service/address-search-v2/postcode-search?countryCode=GB&limit=200&locale=en_GB&postcode=OX1+1BX'},
+    {'origin': 'bat-ship-service', 'path': '/news/en_US/2014/04/29/0001/muevala-a-new-economical-service-to-send-packages'},
+    {'origin': 'bat-track-service', 'path': '/service/address-search-v2/postcode-search?countryCode=GB&limit=200&locale=en_GB&postcode=11a'},
+    {'origin': 'bat-track-service', 'path': '/service/address-search-v2/postcode-search?countryCode=GB&limit=200&locale=en_GB&postcode=aa1+1aa'},
+    {'origin': 'label-service', 'path': '/service/shipment-history/shipments/eb6af3b2-1a63-4db7-8b5c-872a6cf18118/status?channel=myTNT&locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/shipment-history/shipments/status'},
+    {'origin': 'timezone-service', 'path': '/service/shipment-history/shipments?channel=myTNT&limit=30&locale=en_GB&offset=0&order=DESC&orderBy=createdAt&q='},
+    {'origin': 'timezone-service', 'path': '/service/shipment-history/shipments/status'},
+    {'origin': 'bat-ship-service', 'path': '/service/shipment-history/shipments?channel=myTNT&limit=30&locale=en_GB&offset=0&order=DESC&orderBy=createdAt&q='},
+    {'origin': 'bat-ship-service', 'path': '/service/shipment-history/shipments/eb6af3b2-1a63-4db7-8b5c-872a6cf18118?channel=myTNT&locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/shipment-history/shipments?channel=myTNT&limit=30&locale=en_GB&offset=0&order=DESC&orderBy=createdAt&q='},
+    {'origin': 'timezone-service', 'path': '/service/shipment-history/shipments/eb6af3b2-1a63-4db7-8b5c-872a6cf18118?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/shipment-history/shipments?channel=myTNT&limit=30&locale=en_GB&offset=0&order=DESC&orderBy=createdAt&q='},
+    {'origin': 'bat-track-service', 'path': '/service/shipment-history/shipments/status'},
+    {'origin': 'bat-ship-service', 'path': '/service/shipment-history/shipments/eb6af3b2-1a63-4db7-8b5c-872a6cf18118?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/shipment-history/shipments/status'},
+    {'origin': 'bat-ship-service', 'path': '/service/shipment-history/shipments?channel=myTNT&limit=30&locale=en_GB&offset=0&order=DESC&orderBy=createdAt&q=j'},
+    {'origin': 'label-service', 'path': '/service/shipment-history/shipments/eb6af3b2-1a63-4db7-8b5c-872a6cf18118?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/shipment-history/shipments/status'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=&country=US'},
+    {'origin': 'bat-track-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=US&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=&country=US'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=10001,Empire+State&country=US'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=US&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-ship-service', 'path': '/service/bob-service/v1/best-carrier-quote'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=&country=AF'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=5000,Namur&country=BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies?limit=15&locale=en_GB&offset=0&order=ASC&orderBy=companyName&status=APPROVED,REJECTED'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/authentication/register'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/efc3c6db-f16f-476b-b009-6b7a0b3c6425'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies?limit=15&locale=en_GB&offset=0&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/20fd0fcf-e2a6-4317-b4cd-9c341bde5b16/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies?limit=15&locale=en_GB&offset=0&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/efc3c6db-f16f-476b-b009-6b7a0b3c6425?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/draft-service/v1/templates/link'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=1111AA,Diemen&country=NL'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/draft-service/v1/templates/465cb78d-9868-44c6-bf7f-9dc2037f69c1?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'bat-ship-service', 'path': '/service/draft-service/v1/templates/465cb78d-9868-44c6-bf7f-9dc2037f69c1?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies?country=DZ&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=companyName&status=APPROVED,REJECTED'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=username&role=ADMIN&searchQuery='},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=1200+AA,Hilversum&country=NL'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=3000AA,Rotterdam&country=NL'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies?country=CZ&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies?country=BN&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'bat-ship-service', 'path': '/service/special-services-service/v1/companies/8149d05d-3261-4a49-a5b4-4a4bb7dc3fd6?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=1000,Brussel&country=BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=nl_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=username&role=TNT_CUSTOMER&searchQuery='},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies?country=DE&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=20355,Hamburg&country=DE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=20355&country=DE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=&country=AF'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=1230+AB,Loosdrecht&country=NL'},
+    {'origin': 'label-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=1230+AB,Loosdrecht&country=NL'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/9ed06085-ef87-4ec1-b211-54f698bb902e?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-track-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=Brussel&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies?limit=30&locale=en_GB&offset=0&status='},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=fr_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=54294,Trier&country=DE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=nl_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=&country=AF'},
+    {'origin': 'label-service', 'path': '/service/bat-ship-service/v1/shipments'},
+    {'origin': 'bat-ship-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-track-service', 'path': '/service/draft-service/v1/templates/2dc737e8-f601-4ba4-9256-3feb36e3a9ea?locale=en_VN'},
+    {'origin': 'bat-track-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_VN&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'bat-track-service', 'path': '/service/bob-service/v1/best-carrier-quote'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/8134e0a2-8f8b-47dc-a14f-df9afcc3e21b?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=IE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=&country=BT'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=&country=AF'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=username&role=TNT_CUSTOMER&searchQuery='},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=username&role=TNT_CUSTOMER&searchQuery='},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_VN'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_VN'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_VN'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/special-services-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?channel=myTNT&locale=en_VN'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/label-service/v1/labels/d6016de5-acf2-4ec1-8061-f3c5f8c47445'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies?limit=30&locale=en_VN&offset=0&status='},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_VN'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users?locale=en_CY&username=anothermytnttest@yopmail.com'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/draft-service/v1/templates/9bdff45f-05b1-4516-b155-e45684136782?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_VN'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_VN'},
+    {'origin': 'timezone-service', 'path': '/service/draft-service/v1/templates/465cb78d-9868-44c6-bf7f-9dc2037f69c1?locale=en_VN'},
+    {'origin': 'bat-track-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_VN'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_VN'},
+    {'origin': 'label-service', 'path': '/service/special-services-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=&country=US'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=10001,Empire+State&country=US'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=UY&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=1200+AA,Hilversum&country=NL'},
+    {'origin': 'bat-ship-service', 'path': '/service/bob-service/v1/best-carrier-quote'},
+    {'origin': 'bat-ship-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=10001,Empire+State&country=US'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=US&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=9742VD,Groningen&country=NL'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_VN'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/special-services-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/users'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/8134e0a2-8f8b-47dc-a14f-df9afcc3e21b?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/8134e0a2-8f8b-47dc-a14f-df9afcc3e21b?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=&country=GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_VN'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_VN'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies?limit=15&locale=en_GB&offset=0&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=username&role=TNT_CUSTOMER&searchQuery='},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=username&role=TNT_CUSTOMER&searchQuery='},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies?country=DE&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=companyName&status=APPROVED,REJECTED'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies?country=DE&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies?country=DE&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=1230+AB,Loosdrecht&country=NL'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=fr_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=60200,Brno&country=CZ'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies?limit=15&locale=en_GB&offset=0&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies?country=CZ&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=companyName&status=APPROVED,REJECTED'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies?country=DE&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'timezone-service', 'path': '/service/special-services-service/v1/companies/17c3a9b0-dff2-4558-afe4-92fc059ba0a9?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/14289b2a-13f2-49f6-8356-fbb0cb4830c1?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/special-services-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies?country=BN&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=companyName&status=APPROVED,REJECTED'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies?limit=15&locale=en_GB&offset=0&order=ASC&orderBy=companyName&status=APPROVED,REJECTED'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies?limit=30&locale=en_GB&offset=0&status='},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=AF&locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=&country=AF'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/e4b37488-39be-4c7a-85a6-6433ee6e056c/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/ad6f1135-d93a-41fa-a7e2-f96725e0d8fe?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/de406535-d9e7-4097-9519-837562b83cee/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies?limit=30&locale=en_GB&offset=0&status='},
+    {'origin': 'bat-track-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies?limit=30&locale=en_GB&offset=0&status='},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=&country=AF'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=AF&locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=&country=AF'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=951+41,Luzianky&country=SK'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=fr_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=AF&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=Dublin&country=IE'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=&country=IE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/bat-ship-service/v1/shipments'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/special-services-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?channel=myTNT&locale=en_VN'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_VN'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_VN'},
+    {'origin': 'timezone-service', 'path': '/service/bat-ship-service/v1/shipments'},
+    {'origin': 'bat-track-service', 'path': '/service/draft-service/v1/templates/2dc737e8-f601-4ba4-9256-3feb36e3a9ea?locale=en_VN'},
+    {'origin': 'timezone-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_VN&offset=0&order=ASC&orderBy=name&searchQuery=gsd'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=AF&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_VN&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'timezone-service', 'path': '/service/bob-service/v1/best-carrier-quote'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies?limit=30&locale=en_GB&offset=0&status='},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users?locale=en_CY&username=Anothermytnttest@yopmail.com'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_VN'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=160+00,Praha&country=CZ'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=8225+KA,Lelystad&country=NL'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'label-service', 'path': '/service/special-services-service/v1/companies/efc3c6db-f16f-476b-b009-6b7a0b3c6425'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/20fd0fcf-e2a6-4317-b4cd-9c341bde5b16/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies?limit=15&locale=en_GB&offset=0&order=ASC&orderBy=companyName&status=APPROVED,REJECTED'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies?limit=15&locale=en_GB&offset=60&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=1014+AA&country=NL'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=160+00,Praha&country=CZ'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_VN'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_VN'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=8225+KA,Lelystad&country=NL'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_VN'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_VN'},
+    {'origin': 'bat-track-service', 'path': '/service/special-services-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?channel=myTNT&locale=en_VN'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_VN'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_VN'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_VN'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=US&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=10001,Empire+State&country=US'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=10001,Empire+State&country=US'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=US&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=&country=US'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=&country=NL'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'label-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=1230+AB,Loosdrecht&country=NL'},
+    {'origin': 'timezone-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies?country=DZ&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=username&role=TNT_CUSTOMER&searchQuery='},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=username&role=TNT_CUSTOMER&searchQuery='},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/17c3a9b0-dff2-4558-afe4-92fc059ba0a9?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=username&role=TNT_CUSTOMER&searchQuery='},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies?limit=15&locale=en_GB&offset=0&order=ASC&orderBy=companyName&status=APPROVED,REJECTED'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'label-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=&country=AF'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=nl_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/7fa677e1-7b99-4ba9-b6b4-922365f3cd6e?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies?limit=30&locale=en_GB&offset=0&status='},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=54294,Trier&country=DE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=&country=CZ'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=AF&locale=nl_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=AF&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'label-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=1230+AB,Loosdrecht&country=NL'},
+    {'origin': 'bat-ship-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=1000,Brussel&country=BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/ad6f1135-d93a-41fa-a7e2-f96725e0d8fe?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies?limit=30&locale=en_GB&offset=0&status='},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/e4b37488-39be-4c7a-85a6-6433ee6e056c/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/e4b37488-39be-4c7a-85a6-6433ee6e056c/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/e4b37488-39be-4c7a-85a6-6433ee6e056c/preferences?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/708774e0-c37e-4b4e-a963-22d7ffbd93ef?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=1000,Brussel&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=Monrovia&country=LR'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/bob-service/v1/best-carrier-quote'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_VN'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_VN'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_VN'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies?limit=30&locale=en_GB&offset=0&status='},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_VN'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_VN'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=&country=AF'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=1200+AA,Hilversum&country=NL'},
+    {'origin': 'timezone-service', 'path': '/service/special-services-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies?limit=30&locale=en_GB&offset=0&status='},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/special-services-service/v1/companies/8134e0a2-8f8b-47dc-a14f-df9afcc3e21b?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies?limit=30&locale=en_GB&offset=0&status='},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/bat-ship-service/v1/shipments'},
+    {'origin': 'label-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/draft-service/v1/templates/465cb78d-9868-44c6-bf7f-9dc2037f69c1'},
+    {'origin': 'label-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/efc3c6db-f16f-476b-b009-6b7a0b3c6425?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies?limit=15&locale=en_GB&offset=0&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=AF&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/20fd0fcf-e2a6-4317-b4cd-9c341bde5b16/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies?limit=15&locale=en_GB&offset=0&order=ASC&orderBy=companyName&status=APPROVED,REJECTED'},
+    {'origin': 'label-service', 'path': '/service/special-services-service/v1/companies/efc3c6db-f16f-476b-b009-6b7a0b3c6425?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/efc3c6db-f16f-476b-b009-6b7a0b3c6425?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/efc3c6db-f16f-476b-b009-6b7a0b3c6425?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/efc3c6db-f16f-476b-b009-6b7a0b3c6425?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies?limit=15&locale=en_GB&offset=45&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'bat-ship-service', 'path': '/service/draft-service/v1/templates/465cb78d-9868-44c6-bf7f-9dc2037f69c1?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/efc3c6db-f16f-476b-b009-6b7a0b3c6425?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=1000,Brussel&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_VN'},
+    {'origin': 'label-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_VN&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'bat-track-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_VN'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_VN'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/e4b37488-39be-4c7a-85a6-6433ee6e056c/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/9ed06085-ef87-4ec1-b211-54f698bb902e?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/9ed06085-ef87-4ec1-b211-54f698bb902e?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/9ed06085-ef87-4ec1-b211-54f698bb902e?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_VN'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_VN&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'bat-track-service', 'path': '/service/draft-service/v1/templates/465cb78d-9868-44c6-bf7f-9dc2037f69c1?locale=en_VN'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/authentication/register'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_VN'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=1200+AA,Hilversum&country=NL'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=US&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=&country=UY'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=1230+AB,Loosdrecht&country=NL'},
+    {'origin': 'bat-track-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=&country=BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'label-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies?limit=15&locale=en_GB&offset=0&order=ASC&orderBy=companyName&status=APPROVED,REJECTED'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies?limit=15&locale=en_GB&offset=0&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies?country=DE&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=companyName&status=APPROVED,REJECTED'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies?country=DE&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=companyName&status=APPROVED,REJECTED'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'timezone-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'timezone-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=1230+AB,Loosdrecht&country=NL'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=1000,Brussel&country=BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/7fa677e1-7b99-4ba9-b6b4-922365f3cd6e?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/special-services-service/v1/companies/7fa677e1-7b99-4ba9-b6b4-922365f3cd6e?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies?limit=30&locale=en_GB&offset=0&status='},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=fr_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies?limit=30&locale=en_GB&offset=0&status='},
+    {'origin': 'timezone-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=&country=BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'timezone-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=1230+AB,Loosdrecht&country=NL'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=AF&locale=nl_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/ad6f1135-d93a-41fa-a7e2-f96725e0d8fe?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies?limit=30&locale=en_GB&offset=0&status='},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=nl_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=nl_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/special-services-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?channel=myTNT&locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/special-services-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?channel=myTNT&locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users?locale=en_GB&username=Ireland_Test@yopmail.com'},
+    {'origin': 'label-service', 'path': '/service/special-services-service/v1/companies/efc3c6db-f16f-476b-b009-6b7a0b3c6425?channel=myTNT&locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies?limit=15&locale=en_GB&offset=30&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies?limit=15&locale=en_GB&offset=0&order=ASC&orderBy=companyName&status=APPROVED,REJECTED'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/authentication/activate'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=AF&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=AF&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=160+00,Praha&country=CZ'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=fr_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/draft-service/v1/templates/de350a82-744f-44ba-8884-3f540eb0c52b?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/special-services-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_VN'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_VN'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_VN'},
+    {'origin': 'bat-ship-service', 'path': '/service/special-services-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?channel=myTNT&locale=en_VN'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/special-services-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?channel=myTNT&locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/special-services-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?channel=myTNT&locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_VN'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences'},
+    {'origin': 'label-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'label-service', 'path': '/service/draft-service/v1/templates/2dc737e8-f601-4ba4-9256-3feb36e3a9ea'},
+    {'origin': 'bat-track-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_VN&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'label-service', 'path': '/service/special-services-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?channel=myTNT&locale=en_VN'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/users?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies?limit=30&locale=en_VN&offset=0&status='},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_VN'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_VN'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies?limit=30&locale=en_VN&offset=0&status='},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2132LR,Hoofddorp&country=NL'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_VN'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_VN'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=LR&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=AD&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_VN&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_VN'},
+    {'origin': 'timezone-service', 'path': '/service/bob-service/v1/best-carrier-quote'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BT&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/draft-service/v1/templates'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=160+00,Praha&country=CZ'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=nl_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'timezone-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=1230+AB,Loosdrecht&country=NL'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/bob-service/v1/best-carrier-quote'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=AF&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=7000,Mons&country=BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=1230+AB,Loosdrecht&country=NL'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=1230+AB,Loosdrecht&country=NL'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=fr_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/bob-service/v1/best-carrier-quote'},
+    {'origin': 'bat-ship-service', 'path': '/service/special-services-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?channel=myTNT&locale=en_VN'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_VN'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a7af5235-d832-48c1-8047-39166d34a7b7/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/special-services-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?channel=myTNT&locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/bob-service/v1/best-carrier-quote'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/1f6537de-d6a4-4346-b9d4-3d7afa843c6e?locale=en_VN'},
+    {'origin': 'bat-ship-service', 'path': '/service/timezone-service/v1/timezone?address=111111,Moscow&country=RU'},
+    {'origin': 'bat-ship-service', 'path': '/service/bob-service/v1/best-carrier-quote'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_VN'},
+    {'origin': 'bat-track-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/493e1c93-8f25-4452-be83-0203b9025f65?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/1773adb0-6d3c-4bfe-9f7c-f144adca1ce0?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/special-services-service/v1/companies/1773adb0-6d3c-4bfe-9f7c-f144adca1ce0?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=username&role=TNT_CUSTOMER&searchQuery='},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies?country=DE&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=companyName&status=APPROVED,REJECTED'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies?limit=15&locale=en_GB&offset=0&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'label-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=1000,Brussel&country=BE'},
+    {'origin': 'timezone-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'timezone-service', 'path': '/service/special-services-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?channel=myTNT&locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'label-service', 'path': '/service/timezone-service/v1/timezone?address=8225+ka,Lelystad&country=NL'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies?country=CZ&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies?country=BH&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=companyName&status=APPROVED,REJECTED'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies?country=BH&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=updatedAt&status=NEW,MODIFIED'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies?country=CZ&limit=15&locale=en_GB&offset=0&order=ASC&orderBy=companyName&status=APPROVED,REJECTED'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/8149d05d-3261-4a49-a5b4-4a4bb7dc3fd6?locale=en_GB'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=fr_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=nl_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=25333,Elmshorn&country=DE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/users/a84e162a-e84e-4d89-968a-46eccf0d667e/preferences?locale=en_GB'},
+    {'origin': 'label-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/customs-rules-service/v1/customs-rules'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences?locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=BE&locale=en_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=nl_BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/users/b644414d-851c-48b6-b4d0-7ca34b999783/preferences'},
+    {'origin': 'label-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=fr_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/draft-service/v1/templates?limit=30&locale=en_GB&offset=0&order=ASC&orderBy=name&searchQuery='},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'},
+    {'origin': 'bat-ship-service', 'path': '/service/identity-service/v1/companies/ded7f842-7eca-4a22-886f-cdb3a4976758?locale=en_GB'},
+    {'origin': 'timezone-service', 'path': '/service/country-profile-service/v1/country-profiles?channel=BAT&countrycode=NL&locale=en_BE'},
+    {'origin': 'bat-track-service', 'path': '/service/timezone-service/v1/timezone?address=2850,Boom&country=BE'},
+    {'origin': 'timezone-service', 'path': '/service/identity-service/v1/companies/89a21af2-47ba-4b65-95fc-ade05eb12765?locale=en_BE'}
+]
 
 # Convenience function to determine similarity of two strings
 def similar(a, b):
     return SequenceMatcher(None, a, b).ratio() > 0.7
 
 # Analyze the request and strip out dynamic or useless elements
-def stripRequest(request):
+def strip_request(request):
     # Strip off the HTTP protocol version
     request = request.replace('HTTP/1.1', '')
 
@@ -40,92 +1009,133 @@ def stripRequest(request):
         flags=re.IGNORECASE
     )
 
-    # Strip out sequences of four digits and longer, they're probably an identifier
-    request = re.sub(r"\d\d\d\d+", '{ID}', request)
+    # Strip out sequences of digits, they're probably an identifier
+    request = re.sub(r"\/\d+\/", '/{ID}/', request)
 
     # We are also not interested in any query parameters
-    request = request[:request.find('?')]
+    if request.find('?') != -1:
+        request = request[:request.find('?')]
 
     return request
 
-logger.info('Building graph nodes...')
 
-# Create a directed graph
-G = nx.DiGraph()
+def split_request(request):
+    logger.info(request)
+    # logger.info(request)
+    request_match = re.search(r'^\/service\/(.+?)\/(.*)', request)
+    if request_match:
+        # First item is service name (backend), second is the path
+        return request_match.group(1), request_match.group(2)
+    else:
+        return None, None
 
-# Add the graph nodes
-G.add_nodes_from(components)
 
-# For each component, retrieve the logs and analyse the requests to build the
-# graph edges.
-for component in components:
-    logger.info("Building edges for {0}".format(component))
+# Set node size to value between 1-10
+def node_size(min, max, value):
+    old_range = (max - min)
+    new_range = 5 - 1
+    new_value = round((((value - min) * new_range) / old_range) + 1)
+    return new_value
 
-    edges = []
+# 2D dict (dict of dicts) [target][origin] of all paths requested from target by origin
+requests = defaultdict(lambda: defaultdict(list))
+for request in request_logs:
+    logger.debug(request)
 
-    # If dict key does not exist, init with an empty list automatically
-    requests = defaultdict(lambda: [])
+    request_match = re.search(r'^\/service\/(.+?)\/.*', request['path'])
 
-    # Fetch the logs from Elasticsearch
-    response = client.search(
-        index="haproxy-*",
-        scroll = '2m',
-        search_type = 'scan',
-        size = 5000,
-        body={
-            "query": {
-              "bool": {
-                "must": [
-                  {
-                    "match": {
-                      "request_headers": {
-                        "query": "\"{0}\"".format(component),
-                        "type": "phrase"
-                      }
-                    }
-                  }
-                ],
-                "filter": [
-                  {
-                    "term": {
-                      "env": "production"
-                    }
-                  }
-                ]
-              }
-            }
-        }
-    )
+    if request_match:
+        target = request_match.group(1)
+        # path = strip_request(request_match.group(2))
+        requests[target][request['origin']].append(strip_request(request['path']))
 
-    # Initialise the scroll parameters
-    sid = response['_scroll_id']
-    scroll_position = 0
+# print(json.dumps(requests))
 
-    # Start scrolling until we hit 50000 logs
-    while (scroll_position < 50000):
-        page = client.scroll(scroll_id = sid, scroll = '2m')
-        sid = page['_scroll_id']
+# 2D dict (dict of dicts) [target][origin] of counts per unique path requested from target by origin
+request_counts = { target: { origin: Counter(paths) for origin, paths in origins.items() } for target, origins in requests.items() }
+# print(json.dumps(request_counts))
 
-        hits = page['hits']['hits']
-        scroll_position += len(hits)
+request_counts_target_per_origin = { target: { origin: sum(paths.values()) for origin, paths in origins.items() } for target, origins in request_counts.items() }
+# print(json.dumps(request_counts_target_per_origin))
+# request_total = [(target, {'size': request_count}) for target, request_count in request_counts_per_backend.items()]
+# print(json.dumps(request_counts_per_backend))
 
-        if len(hits) > 0:
-            for hit in hits:
-                # Sanatize the request
-                hitRequest = stripRequest(hit['_source']['http_request'])
-                hitBackend = hit['_source']['backend_name']
 
-                # Do an url similarity check on previously added requests
-                if all(not similar(existingRequest, hitRequest) for existingRequest in requests[hitBackend]):
-                    requests[hitBackend].append(hitRequest)
+# for application, paths in applications.items():
+#     requests_count[application] = Counter(paths)
 
-            # Add the edges
-            for backend, reqs in requests.iteritems():
-                if len(reqs) > 0:
-                    G.add_edge(component, backend, None, requests="*".join(reqs), count=len(reqs))
-        else:
-            # No more hits, so move on to the next component
-            break
+# print(json.dumps(requests_count))
+# for paths in requests_count.values():
+#     print(sum(paths.values()))
+    # print(sum(paths))
 
-# Write the graph
+#
+# logger.info('Building graph nodes...')
+#
+# # Create a directed graph
+G = nx.MultiDiGraph()
+#
+# # Add the graph nodes
+request_counts_per_backend = {target: sum(origins.values()) for target, origins in request_counts_target_per_origin.items()}
+# print(json.dumps(request_counts_per_backend))
+G.add_nodes_from([(target, {'size': node_size(min(request_counts_per_backend.values()), max(request_counts_per_backend.values()), request_count)}) for target, request_count in request_counts_per_backend.items()])
+#
+# # For each component, retrieve the logs and analyse the requests to build the
+# # graph edges.
+# for component in components:
+#     logger.info("Building edges for {0}".format(component))
+#
+#     edges = []
+#
+#     # If dict key does not exist, init with an empty list automatically
+#     requests = defaultdict(lambda: [])
+#
+#     for logline in loglines:
+#         # Sanatize the request
+#         hitBackend, hitRequest = split_request(strip_request(logline))
+#
+#         # Do an url similarity check on previously added requests
+#         if hitRequest:
+#             if all(not similar(existingRequest, hitRequest) for existingRequest in requests[hitBackend]):
+#                 requests[hitBackend].append(hitRequest)
+#
+#     logger.info(requests.items())
+#
+# Add the edges
+
+
+for target, origins in request_counts_target_per_origin.items():
+    for origin, request_count in origins.items():
+        G.add_edge(origin, target, None, count=0, requests=request_count, requestPaths="*".join(request_counts[target][origin].keys()))
+
+# print(type(G))
+# print(G.has_node('timezone-service'))
+# print(G.has_node('bat-track-service'))
+# print(G.in_edges('bat-track-service'))
+# print(G.out_edges('bat-track-service'))
+# print(G.number_of_edges('bat-track-service', 'timezone-service'))
+
+# Assign count/amplitude for multiple edges between two node
+nodes_with_parallel_edges = defaultdict(list)
+for origin in G.nodes():
+    for target in G.nodes():
+        if G.get_edge_data(origin, target) and G.get_edge_data(target, origin):
+            # print("Multiple edges between " + origin + " and " + target)
+            if not target in nodes_with_parallel_edges.keys():
+                nodes_with_parallel_edges[origin].append(target)
+
+# print(nodes_with_parallel_edges)
+for origin, targets in nodes_with_parallel_edges.items():
+    print(origin)
+    for target in targets:
+        print(target)
+        for edge, edge_data in G.get_edge_data(origin, target).items():
+            G[target][origin][edge]['count'] = 1
+            G[origin][target][edge]['count'] = -1
+#         number_of_edges = G.number_of_edges()
+#         print(number_of_edges)
+#         if (number_of_edges > 1):
+#             print(origin + ' - ' + target)
+
+# # Write the graph
 nx.write_gexf(G, "graph.gexf", version="1.2draft")

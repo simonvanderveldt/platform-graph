@@ -15,7 +15,8 @@ s = new sigma({
     enableEdgeHovering: true,
     edgeHoverColor: 'edge',
     edgeHoverSizeRatio: 2,
-    edgeHoverExtremities: true
+    edgeHoverExtremities: true,
+    labelThreshold: 0
   }
 });
 
@@ -28,14 +29,18 @@ sigma.parsers.gexf('graph.gexf', s, function(s) {
     s.graph.nodes().forEach(function(node, i, a) {
       node.x = Math.cos(Math.PI * 2 * i / a.length)
       node.y = Math.sin(Math.PI * 2 * i / a.length)
-      node.size = 15
       node.color = randomColor({luminosity: 'light', format: 'rgb'})
+      node.size = node.attributes[0]
     });
 
     // Set size and label of edges based on the attributes
     s.graph.edges().forEach(e => {
-      e.size = e.attributes[0]
-      e.label = e.attributes[1]
+      e.size = e.attributes[2]
+      e.label = e.attributes[3]
+      if (e.attributes[1] != 0) {
+        e.type = 'curvedArrow'
+        e.count = e.attributes[1]
+      }
     });
 
     // Refresh the data structure
